@@ -1,0 +1,371 @@
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from google import genai
+import os
+import base64
+import subprocess
+import tempfile
+import asyncio
+from typing import List, Dict, Any
+import httpx
+import json
+# from playwright.async_api import async_playwright
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(redirect_slashes=False)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------- Utilities ------------------
+
+def task_breakdown(task: str) -> str:
+    """Break down a task into smaller programmable steps using Google GenAI."""
+    client = genai.Client(api_key= "AIzaSyA_JPZsn4BOP1Np0MsgFcMgxKbW9GNsh0c")
+
+    prompt_file = "step_prompt.txt" # os.path.join('prompts', "step_prompt.txt")
+    with open(prompt_file, 'r') as f:
+        task_breakdown_prompt = f.read()
+
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-lite",
+        contents=[task, task_breakdown_prompt],
+    )
+    
+    with open("broken_task.txt", "w") as f:
+        f.write(response.text)
+
+    return response.text
+
+def encode_image_base64(image_bytes: bytes, content_type: str) -> str:
+    base64_str = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{content_type};base64,{base64_str}"
+
+# ------------ Web Scraping Tools ------------
+
+async def scrape_website(url: str, timeout: int = 60000) -> str:
+    """Scrape website HTML content with Playwright (headless)."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            content = await page.content()
+        except Exception as e:
+            content = f"Failed to scrape {url}: {str(e)}"
+        await browser.close()
+        return content
+
+def get_relevant_data(html_content: str, css_selector: str = None) -> Dict[str, Any]:
+    """Parse HTML and extract relevant data using BeautifulSoup."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    if css_selector:
+        elements = soup.select(css_selector)
+        data = [el.get_text(strip=True) for el in elements]
+        return {"data": data}
+    return {"data": soup.get_text(strip=True)}
+
+# ----------- LLM Integration -------------
+import re
+
+def extract_python_code_block(markdown: str) -> str:
+    match = re.search(r"```(?:python)?\n(.*?)```", markdown, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return markdown.strip() 
+
+def query_llm_for_code(task_steps: List[str], tools: List[Dict[str, Any]], file_context: str = "") -> str:
+    client = genai.Client(api_key="AIzaSyA_JPZsn4BOP1Np0MsgFcMgxKbW9GNsh0c")
+
+    prompt = (
+        "You are a data analysis agent. Here are the broken down steps of a data analysis task:\n\n" +
+        "\n".join(f"{i+1}. {step}" for i, step in enumerate(task_steps)) +
+        "\n\nGenerate a complete executable error-free Python program that performs these steps." +
+        "\n\nThe following files were uploaded and may be relevant to the task:\n\n" +
+        (file_context or "[No files provided]") +
+        "\nUse the provided tools (e.g. scrape_website, get_relevant_data) only if necessary." +
+        "\nUse only the following libraries: beautifulsoup, playwright, pandas, numpy, pyarrow, duckdb, matplotlib, seaborn, pymupdf, json, re, base64 and datetime." +
+        "\nAvoid using libraries that are not listed. Ensure the code provides the response in the correct format specified. Do not provide explanations. Just output the code block."
+    )
+
+    response = client.models.generate_content(
+        model="models/gemini-1.5-flash",  # ✅ Use supported model
+        contents=[prompt]
+    )
+
+    return response.text
+
+
+# Define the tools for the LLM to use:
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_website",
+            "description": "Scrapes a website and returns HTML content",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL of the website to scrape"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in milliseconds",
+                        "default": 60000
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": False
+            },
+            # "strict": True,
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_relevant_data",
+            "description": "Extracts relevant data from given HTML content using CSS selectors",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "html_content": {
+                        "type": "string",
+                        "description": "HTML content to parse"
+                    },
+                    "css_selector": {
+                        "type": "string",
+                        "description": "CSS selector to target elements"
+                    }
+                },
+                "required": ["html_content"],
+                "additionalProperties": False
+            },
+            # "strict": True,
+        }
+    }
+]
+
+
+async def run_python_code_with_correction(
+    initial_code: str,
+    max_retries: int = 3
+) -> Dict[str, Any]:
+    """
+    Runs Python code with subprocess.
+    On error, sends error+code back to LLM for correction.
+    Retries up to max_retries times.
+    """
+    client = genai.Client(api_key= "AIzaSyA_JPZsn4BOP1Np0MsgFcMgxKbW9GNsh0c")
+    code = initial_code
+    code=extract_python_code_block(initial_code)
+
+    for attempt in range(1, max_retries + 1):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=True) as tmp_file:
+            tmp_file.write(code)
+            tmp_file.flush()
+
+            proc = subprocess.run(
+                ["python", tmp_file.name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            stdout = proc.stdout
+            stderr = proc.stderr
+
+            if proc.returncode == 0:
+                # Success
+                return {
+                    "success": True,
+                    "output": stdout,
+                    "error": None,
+                    "code": code,
+                    "attempts": attempt,
+                }
+            else:
+                # Failed, ask LLM to fix code
+                prompt_fix = f"""
+                The following Python code has an error:
+                ```python
+{code}
+The error is:
+{stderr}
+Please provide a corrected, executable Python code snippet that fixes this error.
+Only provide the corrected code block, no explanations."""
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=[prompt_fix],
+                    )
+                code = response.text
+                code=extract_python_code_block(code)
+
+# Max retries reached, return last error and code
+    return {
+    "success": False,
+    "output": stdout,
+    "error": stderr,
+    "code": code,
+    "attempts": max_retries,
+    }
+
+
+# ------------- FastAPI Endpoints -----------------
+
+@app.get("/")
+async def root():
+    return {"message": "Hello! Send POST to /api with files."}
+
+@app.post("/api")
+async def upload_files(request: Request):
+    form = await request.form()
+    files = []
+    questions_text = None
+
+    for field_name, upload in form.items():
+        logger.info(f"FIELD: {field_name}, VALUE TYPE: {type(upload)}")
+        # if isinstance(upload, UploadFile):
+        if hasattr(upload, 'filename') and hasattr(upload, 'file'):
+            logger.info(f"Upload file received: {upload.filename}")
+            content_bytes = await upload.read()
+            logger.info(f"Field name: {field_name}, Uploaded filename: {upload.filename}")
+            # Check if this is the required questions.txt file
+            if hasattr(upload, "filename") and upload.filename in ["questions.txt", "question.txt"]:
+
+                try:
+                    questions_text = content_bytes.decode("utf-8") # .strip()
+                    logger.info(f"[Raw questions.txt]: {repr(questions_text)}")
+                    logger.info(f"Received questions.txt:\n{questions_text}")
+                    logger.info(f"questions.txt size: {len(content_bytes)} bytes")
+                except Exception:
+                    logger.error(f"UTF-8 decode error in questions.txt: {e}")
+                    return JSONResponse(status_code=400, content={"error": "questions.txt must be a UTF-8 text file."})
+                continue
+
+            # Try decoding as UTF-8 (for CSV, text, etc.)
+            else:
+                try:
+                    decoded_content = content_bytes.decode("utf-8")
+                    file_content = decoded_content
+                    preview = decoded_content[:200] + ("..." if len(decoded_content) > 200 else "")
+                except UnicodeDecodeError:
+                    # Binary file like image — encode to base64
+                    file_content = base64.b64encode(content_bytes).decode("utf-8")
+                    file_content = f"data:{upload.content_type};base64,{file_content}"
+                    preview = file_content[:200] + ("..." if len(file_content) > 200 else "")
+                logger.info(f"Received file: {upload.filename} ({upload.content_type}) - preview:\n{preview}")
+
+                files.append({
+                    "field_name": field_name,
+                    "filename": upload.filename,
+                    "content_type": upload.content_type,
+                    "content": file_content
+                })
+    # print(files)
+    # logger.info(f"files: {files}")
+    if not questions_text or not questions_text.strip():
+
+        logger.warning("questions.txt is empty or only whitespace.")
+        return JSONResponse(status_code=400, content={"error": "questions.txt is required and must be a valid UTF-8 text file."})
+
+    # Task breakdown
+    steps = task_breakdown(questions_text)
+
+    # Build file context for LLM
+    file_context = "\n\n".join(
+        f"Filename: {f['filename']}\nContent:\n{f['content']}" for f in files
+    )
+
+    # Generate code
+    llm_generated_code = query_llm_for_code(steps, tools, file_context)
+
+    # Run the code
+    run_result = await run_python_code_with_correction(llm_generated_code)
+
+    logger.info(f"Full run result:\n{json.dumps(run_result, indent=2)}")
+
+    return run_result["output"]
+
+# @app.post("/api/")
+# async def upload_files(files: List[UploadFile] = File(...)):
+#     results = []
+#     questions_text = None
+#     other_files = []
+
+#     # Read all files first
+#     for file in files:
+#         content_type = file.content_type
+#         content = await file.read()
+
+#         if file.filename == "questions.txt":
+#             questions_text = content.decode("utf-8")
+#         # else:
+#         #     other_files.append({
+#         #         "filename": file.filename,
+#         #         "content_type": content_type,
+#         #         "content_bytes": content
+#         #     })
+#         else:
+#             try:
+#                 file_text = content.decode("utf-8", errors="ignore")
+#                 file_content=file_text
+#             except Exception:
+#                 file_text = "[UNREADABLE FILE]"
+#                 file_content=file_text
+#             except UnicodeDecodeError:
+#             # Binary file like image, keep base64 encoded string for safe transport/storage
+#                 import base64
+#                 file_content = base64.b64encode(content).decode('utf-8')
+#             other_files.append({
+#                 "filename": file.filename,
+#                 "content_type": content_type,
+#                 "content": file_content
+#             })
+
+#     if not questions_text:
+#         return JSONResponse(status_code=400, content={"error": "questions.txt is required."})
+
+#     task_text = questions_text.strip()
+
+#     # Get task breakdown steps from GenAI
+#     steps = task_breakdown(task_text)
+#     file_context = "\n\n".join(
+#         f"Filename: {f['filename']}\nContent:\n{f['content']}" for f in other_files
+#     )
+
+#     # Run the generated code with correction loop
+#     # run_result = await asyncio.to_thread(run_python_code_with_correction, generated_code)
+#     llm_generated_code = await query_llm_for_code(steps, tools, file_context)
+
+# # Run the code and retry on failure
+#     run_result = await run_python_code_with_correction(llm_generated_code)
+
+
+# # Return JSON response
+#     return run_result["output"]
+print("AIPIPE_TOKEN:", os.getenv("AIPIPE_TOKEN"))
+
+
+if __name__ == "__main__":
+     import uvicorn
+     uvicorn.run(app, host="0.0.0.0", port=8000)
+import uvicorn
+# port = int(os.environ.get("PORT", 8000))
+
+# uvicorn.run(app, host="0.0.0.0", port=port)
